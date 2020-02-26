@@ -62,16 +62,9 @@ class LivyServer extends Logging {
 
   private var ugi: UserGroupInformation = _
 
-  def start(): Unit = {
+  def init(): Unit = {
     livyConf = new LivyConf().loadFromFile("livy.conf")
     accessManager = new AccessManager(livyConf)
-
-    val host = livyConf.get(SERVER_HOST)
-    val port = livyConf.getInt(SERVER_PORT)
-    val basePath = livyConf.get(SERVER_BASE_PATH)
-    val multipartConfig = MultipartConfig(
-        maxFileSize = Some(livyConf.getLong(LivyConf.FILE_UPLOAD_MAX_SIZE))
-      ).toMultipartConfigElement
 
     // Make sure the `spark-submit` program exists, otherwise much of livy won't work.
     testSparkHome(livyConf)
@@ -97,10 +90,6 @@ class LivyServer extends Logging {
     livyConf.set(LIVY_SPARK_SCALA_VERSION.key,
       sparkScalaVersion(formattedSparkVersion, scalaVersionFromSparkSubmit, livyConf))
 
-    if (livyConf.getBoolean(LivyConf.THRIFT_SERVER_ENABLED)) {
-      _thriftServerFactory = Some(ThriftServerFactory.getInstance)
-    }
-
     if (UserGroupInformation.isSecurityEnabled) {
       // If Hadoop security is enabled, run kinit periodically. runKinit() should be called
       // before any Hadoop operation, otherwise Kerberos exception will be thrown.
@@ -116,7 +105,7 @@ class LivyServer extends Logging {
       )
       val launch_keytab = livyConf.get(LAUNCH_KERBEROS_KEYTAB)
       val launch_principal = SecurityUtil.getServerPrincipal(
-        livyConf.get(LAUNCH_KERBEROS_PRINCIPAL), host)
+        livyConf.get(LAUNCH_KERBEROS_PRINCIPAL), livyConf.get(SERVER_HOST))
       require(launch_keytab != null,
         s"Kerberos requires ${LAUNCH_KERBEROS_KEYTAB.key} to be provided.")
       require(launch_principal != null,
@@ -145,8 +134,21 @@ class LivyServer extends Logging {
       SparkYarnApp.init(livyConf)
       Future { SparkYarnApp.yarnClient }
     }
-
     StateStore.init(livyConf)
+  }
+
+  def start(): Unit = {
+    val host = livyConf.get(SERVER_HOST)
+    val port = livyConf.getInt(SERVER_PORT)
+    val basePath = livyConf.get(SERVER_BASE_PATH)
+    val multipartConfig = MultipartConfig(
+        maxFileSize = Some(livyConf.getLong(LivyConf.FILE_UPLOAD_MAX_SIZE))
+      ).toMultipartConfigElement
+
+    if (livyConf.getBoolean(LivyConf.THRIFT_SERVER_ENABLED)) {
+      _thriftServerFactory = Some(ThriftServerFactory.getInstance)
+    }
+
     val sessionStore = new SessionStore(livyConf)
     val batchSessionManager = new BatchSessionManager(livyConf, sessionStore)
     val interactiveSessionManager = new InteractiveSessionManager(livyConf, sessionStore)
@@ -294,6 +296,23 @@ class LivyServer extends Logging {
       server.context.addFilter(accessHolder, "/*", EnumSet.allOf(classOf[DispatcherType]))
     }
 
+    //Redirection filter implementation
+    if(livyConf.get(LivyConf.HA_MODE) == HighAvailabilitySettings.HA_ON){
+      info("Starting HA connection")
+
+      val electorService: CuratorElectorService = new CuratorElectorService(livyConf, null)
+      val thread = new Thread {
+        override def run {
+          electorService.start()
+        }
+      }
+      thread.start
+
+      val redirectHolder = new FilterHolder(new DomainRedirectionFilter(electorService))
+      server.context.addFilter(redirectHolder, "/*", EnumSet.allOf(classOf[DispatcherType]))
+    }
+
+    info("Starting HA connection")
     server.start()
 
     _thriftServerFactory.foreach {
@@ -302,9 +321,7 @@ class LivyServer extends Logging {
 
     Runtime.getRuntime().addShutdownHook(new Thread("Livy Server Shutdown") {
       override def run(): Unit = {
-        info("Shutting down Livy server.")
-        server.stop()
-        _thriftServerFactory.foreach(_.stop())
+        stop()
       }
     })
 
@@ -363,7 +380,9 @@ class LivyServer extends Logging {
 
   def stop(): Unit = {
     if (server != null) {
+      info("Shutting down Livy server.")
       server.stop()
+      _thriftServerFactory.foreach(_.stop())
     }
   }
 
@@ -406,18 +425,26 @@ object LivyServer {
     val server = new LivyServer()
     val livyConf = new LivyConf().loadFromFile("livy.conf")
 
-    if(livyConf.get(LivyConf.HA_MODE) == HighAvailabilitySettings.HA_ON){
-      info("Starting HA connection")
-      val electorService: CuratorElectorService = new CuratorElectorService(livyConf, server)
-      electorService.start()
+    server.init()
+    try {
+      server.start()
+      server.join()
+    } finally {
+      server.stop()
     }
-    else {
-      try {
-        server.start()
-        server.join()
-      } finally {
-        server.stop()
-      }
-    }
+
+    //if(livyConf.get(LivyConf.HA_MODE) == HighAvailabilitySettings.HA_ON){
+    //  info("Starting HA connection")
+    //  val electorService: CuratorElectorService = new CuratorElectorService(livyConf, server)
+    //  electorService.start()
+    //}
+    //else {
+    //  try {
+    //    server.start()
+    //    server.join()
+    //  } finally {
+    //    server.stop()
+    //  }
+    //}
   }
 }
